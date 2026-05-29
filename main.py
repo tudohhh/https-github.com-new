@@ -196,4 +196,7 @@ def autocorr_score(series, ws=60):
     vals=[p["v"] for p in series]; A=[]
     for i in range(len(vals)-ws+1):
         w=vals[i:i+ws]; mean=sum(w)/len(w)
-        num=sum((w[j]-mean)*(w[j+1]-mean) for j in
+     num=sum((w[j]-mean)*(w[j+1]-mean) for j in range(len(w)-1))
+        den=sum((x-mean)**2 for x in w)
+        A.append(abs(num/den) if den else 0)
+    return round(sum(A)/len(A),4) if A else 0.5
