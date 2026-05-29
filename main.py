@@ -3,7 +3,6 @@ from datetime import datetime, timezone
 from collections import deque, Counter
 
 FRED_KEY = os.environ.get("FRED_KEY", "617a9e4e8fa1bda0b9e0585ef518fc0c")
-AV_KEY   = os.environ.get("AV_KEY",   "QQB74XYGSGW0MFLN")
 TG_TOKEN = os.environ.get("TG_TOKEN", "8555960020:AAG0Znn3QWVH_zeelJdBRoiVgB2Sem8Aqzs")
 TG_CHAT  = os.environ.get("TG_CHAT",  "1804751540")
 DB_PATH  = os.environ.get("DB_PATH",  "/data/dll_live.db")
@@ -36,7 +35,7 @@ def fetch(url, retries=5, base=1.0):
 def tg(msg):
     try:
         url=(f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
-             f"?chat_id={TG_CHAT}&text={urllib.parse.quote(str(msg))}")
+             f"?chat_id={TG_CHAT}&text={urllib.parse.quote(str(msg)[:4000])}")
         fetch(url)
     except Exception as e:
         print(f"TG error: {e}")
@@ -67,13 +66,18 @@ def db_init(path):
             oil REAL, m2 REAL, hy_spread REAL,
             unemployment REAL, regime TEXT, inserted TEXT
         );
+        CREATE TABLE IF NOT EXISTS triangulation_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts TEXT, pair TEXT, sources TEXT, prices TEXT,
+            max_div_pct REAL, status TEXT
+        );
         CREATE TABLE IF NOT EXISTS snapshots (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             ts TEXT, pair TEXT, regime TEXT,
             market_score REAL, shannon REAL, pe REAL,
             autocorr REAL, hurst REAL,
-            macro_regime TEXT, macro_adj REAL,
-            final_regime TEXT, integrity INTEGER,
+            macro_regime TEXT, final_regime TEXT,
+            integrity INTEGER, tri_status TEXT,
             market_flags TEXT, anomaly_log TEXT,
             blocked INTEGER, input_hash TEXT
         );
@@ -117,16 +121,12 @@ def db_load(con, pair, source, limit=120):
              "v":r[4],"vol":r[5],"spread":round(r[2]-r[3],8)}
             for r in reversed(rows)]
 
-def db_save_macro(con, macro):
-    now=datetime.now(timezone.utc).isoformat()
-    con.cursor().execute("""INSERT INTO macro_context
-        (ts,vix,us10y,us2y,yield_curve,fedfunds,cpi,
-         oil,m2,hy_spread,unemployment,regime,inserted)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-        (now,macro.get("VIX"),macro.get("US10Y"),macro.get("US2Y"),
-         macro.get("YieldCurve"),macro.get("FedFunds"),macro.get("CPI"),
-         macro.get("Oil_WTI"),macro.get("M2"),macro.get("HY_Spread"),
-         macro.get("Unemployment"),macro.get("regime"),now))
+def db_save_tri(con, pair, sources, prices, max_div, status):
+    con.cursor().execute("""INSERT INTO triangulation_log
+        (ts,pair,sources,prices,max_div_pct,status)
+        VALUES (?,?,?,?,?,?)""",
+        (datetime.now(timezone.utc).isoformat(),
+         pair,json.dumps(sources),json.dumps(prices),max_div,status))
     con.commit()
 
 def db_open_trade(con, pair, direction, price, regime, macro_regime):
@@ -227,8 +227,7 @@ def market_composite(series, ws=60):
     pe=pe_score(series,ws)
     ac=autocorr_score(series,ws)
     h=hurst_exp(series)
-    score=round(0.40*sh+0.40*pe+0.20*(1-ac),4)
-    return score,sh,pe,ac,h
+    return round(0.40*sh+0.40*pe+0.20*(1-ac),4),sh,pe,ac,h
 
 def get_macro_latest(con):
     macro={}
@@ -243,40 +242,40 @@ def get_macro_latest(con):
 
 def classify_macro(macro):
     vix=macro.get("VIX",20); yc=macro.get("YieldCurve",0)
-    hy=macro.get("HY_Spread",400); fedfunds=macro.get("FedFunds",2)
-    score=0
-    if vix>40: score-=3
-    elif vix>30: score-=2
-    elif vix>20: score-=1
-    elif vix<15: score+=1
-    if yc<-0.5: score-=2
-    elif yc<0: score-=1
-    elif yc>1.0: score+=1
-    if hy>700: score-=2
-    elif hy>500: score-=1
-    elif hy<300: score+=1
-    if fedfunds>4: score-=1
-    if score<=-4: regime="RISK_OFF_EXTREME"
-    elif score<=-2: regime="RISK_OFF"
-    elif score<=1: regime="NEUTRAL"
-    elif score<=3: regime="RISK_ON"
-    else: regime="RISK_ON_EXTREME"
-    return regime,score
+    hy=macro.get("HY_Spread",400); ff=macro.get("FedFunds",2)
+    s=0
+    if vix>40: s-=3
+    elif vix>30: s-=2
+    elif vix>20: s-=1
+    elif vix<15: s+=1
+    if yc<-0.5: s-=2
+    elif yc<0: s-=1
+    elif yc>1.0: s+=1
+    if hy>700: s-=2
+    elif hy>500: s-=1
+    elif hy<300: s+=1
+    if ff>4: s-=1
+    if s<=-4: r="RISK_OFF_EXTREME"
+    elif s<=-2: r="RISK_OFF"
+    elif s<=1: r="NEUTRAL"
+    elif s<=3: r="RISK_ON"
+    else: r="RISK_ON_EXTREME"
+    return r,s
 
-def macro_adjustment(market_score, macro_regime):
-    adj={"RISK_OFF_EXTREME":+0.04,"RISK_OFF":+0.02,"NEUTRAL":+0.00,
+def macro_adj(score, regime):
+    adj={"RISK_OFF_EXTREME":+0.04,"RISK_OFF":+0.02,"NEUTRAL":0.0,
          "RISK_ON":-0.02,"RISK_ON_EXTREME":-0.04}
-    return round(market_score+adj.get(macro_regime,0),4)
+    return round(score+adj.get(regime,0),4)
 
 def get_regime(score):
     if score>MARKET_THRESH_NATURAL: return "NATURAL"
     elif score<MARKET_THRESH_ORCHESTRATED: return "ORCHESTRATED"
     else: return "UNCERTAIN"
 
-def dll_v13(primary, macro_regime="NEUTRAL"):
+def dll_v14(primary, macro_regime="NEUTRAL"):
     score,sh,pe,ac,h=market_composite(primary)
-    adj_score=macro_adjustment(score,macro_regime)
-    final_regime=get_regime(adj_score)
+    adj=macro_adj(score,macro_regime)
+    regime=get_regime(adj)
     flags=[]
     vols=[p["vol"] for p in primary]
     if any(v>0 for v in vols):
@@ -284,43 +283,53 @@ def dll_v13(primary, macro_regime="NEUTRAL"):
         std_v=(sum((x-mean_v)**2 for x in vols)/len(vols))**0.5
         cv_v=std_v/mean_v if mean_v else 0
         if mean_v>3000 and cv_v<0.05:
-            flags.append(f"WASH:vol={round(mean_v,0)}"); final_regime="ORCHESTRATED"
+            flags.append(f"WASH:{round(mean_v,0)}"); regime="ORCHESTRATED"
     h_label="TRENDING" if h>0.6 else "RANDOM" if h>0.4 else "MEAN_REV"
-    log_parts=[f"sh={sh} pe={pe} ac={ac} H={h}[{h_label}]",
-               f"mkt={score} adj={adj_score} macro={macro_regime}",
-               f"dP50={round(score-MARKET_P50,4):+.4f}"]
     return {"timestamp":datetime.now(timezone.utc).isoformat(),
             "input_hash":hashlib.sha256(
-                json.dumps([p["v"] for p in primary[:10]],
-                sort_keys=True).encode()).hexdigest()[:16],
-            "regime":final_regime,"market_score":score,
-            "adj_score":adj_score,"shannon":sh,"pe":pe,
-            "autocorr":ac,"hurst":h,"hurst_label":h_label,
-            "macro_regime":macro_regime,"integrity_flag":True,
-            "market_flags":flags or [],"anomaly_log":" | ".join(log_parts)}
+                json.dumps([p["v"] for p in primary[:10]]).encode()
+            ).hexdigest()[:16],
+            "regime":regime,"market_score":score,"adj_score":adj,
+            "shannon":sh,"pe":pe,"autocorr":ac,"hurst":h,
+            "hurst_label":h_label,"macro_regime":macro_regime,
+            "integrity_flag":True,"market_flags":flags or [],
+            "anomaly_log":(f"sh={sh} pe={pe} ac={ac} H={h}[{h_label}] "
+                          f"mkt={score} adj={adj} macro={macro_regime}")}
+
+def triangulate_all(prices, tol=0.5):
+    if len(prices)<2: return "SINGLE",{},[],False
+    vals=list(prices.values()); mean_p=sum(vals)/len(vals)
+    divs={s:round(abs(p-mean_p)/mean_p*100,4) for s,p in prices.items()}
+    conflicts=[]
+    srcs=list(prices.keys())
+    for i in range(len(srcs)):
+        for j in range(i+1,len(srcs)):
+            s1,s2=srcs[i],srcs[j]
+            d=abs(prices[s1]-prices[s2])/max(prices[s1],prices[s2])*100
+            if d>tol: conflicts.append(f"{s1}v{s2}:{round(d,3)}%")
+    fail=max(divs.values())>tol if divs else False
+    return ("FAIL" if fail else "OK"),divs,conflicts,fail
 
 class PairGovernor:
-    def __init__(self, pair, thr=3):
+    def __init__(self,pair,thr=3):
         self.pair=pair; self.thr=thr
         self.history=deque(maxlen=50)
         self.blocked=False; self.reason=""; self.consec=0
         self.open_trade_id=None
-    def evaluate(self, snap):
+    def evaluate(self,snap):
         self.history.append(snap)
         self.consec=self.consec+1 if snap["regime"]=="ORCHESTRATED" else 0
         if self.consec>=self.thr and not self.blocked:
-            self.blocked=True
-            self.reason=f"{self.pair}:{self.consec} ORCHESTRATED"
+            self.blocked=True; self.reason=f"{self.pair}:{self.consec}xORC"
         return {**snap,"consec":self.consec,"blocked":self.blocked,
-                "action":"AWAITING_APPROVAL" if self.blocked else "MONITOR"}
+                "action":"AWAITING" if self.blocked else "MONITOR"}
     def override(self):
         self.blocked=False; self.consec=0; self.reason=""
 
-def load_fred(series_id, key=FRED_KEY):
+def load_fred(sid,key=FRED_KEY):
     url=(f"https://api.stlouisfed.org/fred/series/observations"
-         f"?series_id={series_id}&file_type=json&api_key={key}")
-    data=json.loads(fetch(url))
-    out=[]
+         f"?series_id={sid}&file_type=json&api_key={key}")
+    data=json.loads(fetch(url)); out=[]
     for obs in data.get("observations",[]):
         try:
             v=float(obs["value"])
@@ -328,191 +337,175 @@ def load_fred(series_id, key=FRED_KEY):
         except: continue
     return out
 
-def load_kraken(pair, interval=60, limit=150):
+def load_kraken(pair,interval=60,limit=150):
     url=(f"https://api.kraken.com/0/public/OHLC"
          f"?pair={pair}&interval={interval}&count={limit}")
     data=json.loads(fetch(url))
     if data.get("error") and data["error"]: raise Exception(data["error"])
-    result=data["result"]
-    key=[k for k in result if k!="last"][0]
+    result=data["result"]; key=[k for k in result if k!="last"][0]
     return [{"t":datetime.fromtimestamp(c[0],tz=timezone.utc).isoformat(),
              "o":float(c[1]),"h":float(c[2]),"l":float(c[3]),
-             "v":float(c[4]),"vol":float(c[6])}
-            for c in result[key]]
+             "v":float(c[4]),"vol":float(c[6])} for c in result[key]]
 
 def load_cg(coin_id):
-    url=(f"https://api.coingecko.com/api/v3/simple/price"
-         f"?ids={coin_id}&vs_currencies=usd")
-    data=json.loads(fetch(url))
-    return data.get(coin_id,{}).get("usd")
+    url=f"https://api.coingecko.com/api/v3/simple/price?ids={coin_id}&vs_currencies=usd"
+    return json.loads(fetch(url)).get(coin_id,{}).get("usd")
+
+def load_bybit(symbol):
+    url=f"https://api.bybit.com/v5/market/tickers?category=spot&symbol={symbol}"
+    items=json.loads(fetch(url)).get("result",{}).get("list",[])
+    return float(items[0]["lastPrice"]) if items else None
+
+def load_coincap(coin_id):
+    p=json.loads(fetch(f"https://api.coincap.io/v2/assets/{coin_id}")).get("data",{}).get("priceUsd")
+    return float(p) if p else None
+
+def load_er(base,target):
+    rates=json.loads(fetch(f"https://open.er-api.com/v6/latest/{base}")).get("rates",{})
+    return rates.get(target)
 
 def load_fg():
     data=json.loads(fetch("https://api.alternative.me/fng/?limit=1"))
     return int(data["data"][0]["value"]),data["data"][0]["value_classification"]
 
-def _estimate_move(series):
-    vals=[p["v"] for p in series[-20:]]
-    mean=sum(vals)/len(vals)
+def _est_move(series):
+    vals=[p["v"] for p in series[-20:]]; mean=sum(vals)/len(vals)
     std=(sum((x-mean)**2 for x in vals)/len(vals))**0.5
     return round(std/mean*100*5**0.5,4)
 
-def _log_pair(pair,dec,snap,macro,edge,new_k):
-    icon=("⛔" if dec["blocked"] else "🔴" if dec["regime"]=="ORCHESTRATED"
-          else "🟢" if dec["regime"]=="NATURAL" else "🟡")
-    log(f"  {icon} {pair:<10} {dec["regime"]:<14} "
-        f"mkt={snap["market_score"]} adj={snap["adj_score"]} "
-        f"pe={snap["pe"]} H={snap["hurst"]}[{snap["hurst_label"]}] "
-        f"macro={macro} edge={edge}% new={new_k}")
-    if dec["blocked"]: log(f"     BLOCAT: {dec.get("reason","")}")
-
-def _categorize(regime,blocked,pair,nat,orc,unc,blk):
+def _cat(regime,blocked,pair,nat,orc,unc,blk):
     if regime=="NATURAL": nat.append(pair)
     elif regime=="ORCHESTRATED": orc.append(pair)
     else: unc.append(pair)
     if blocked: blk.append(pair)
 
-CRYPTO_PAIRS={
-    "XBTUSD":{"kraken":"XBTUSD","cg":"bitcoin"},
-    "ETHUSD":{"kraken":"ETHUSD","cg":"ethereum"},
-    "SOLUSD":{"kraken":"SOLUSD","cg":"solana"},
-    "ADAUSD":{"kraken":"ADAUSD","cg":"cardano"},
-    "XRPUSD":{"kraken":"XRPUSD","cg":"ripple"},
-    "LINKUSD":{"kraken":"LINKUSD","cg":"chainlink"},
-    "LTCUSD":{"kraken":"LTCUSD","cg":"litecoin"},
-    "ATOMUSD":{"kraken":"ATOMUSD","cg":"cosmos"},
-    "AVAXUSD":{"kraken":"AVAXUSD","cg":"avalanche-2"},
-    "UNIUSD":{"kraken":"UNIUSD","cg":"uniswap"},
+CRYPTO={
+    "XBTUSD":{"kraken":"XBTUSD","cg":"bitcoin","bybit":"BTCUSDT","cc":"bitcoin"},
+    "ETHUSD":{"kraken":"ETHUSD","cg":"ethereum","bybit":"ETHUSDT","cc":"ethereum"},
+    "SOLUSD":{"kraken":"SOLUSD","cg":"solana","bybit":"SOLUSDT","cc":"solana"},
+    "ADAUSD":{"kraken":"ADAUSD","cg":"cardano","bybit":"ADAUSDT","cc":"cardano"},
+    "XRPUSD":{"kraken":"XRPUSD","cg":"ripple","bybit":"XRPUSDT","cc":"xrp"},
+    "LINKUSD":{"kraken":"LINKUSD","cg":"chainlink","bybit":"LINKUSDT","cc":"chainlink"},
+    "LTCUSD":{"kraken":"LTCUSD","cg":"litecoin","bybit":"LTCUSDT","cc":"litecoin"},
+    "ATOMUSD":{"kraken":"ATOMUSD","cg":"cosmos","bybit":"ATOMUSDT","cc":"cosmos"},
+    "AVAXUSD":{"kraken":"AVAXUSD","cg":"avalanche-2","bybit":"AVAXUSDT","cc":"avalanche"},
+    "UNIUSD":{"kraken":"UNIUSD","cg":"uniswap","bybit":"UNIUSDT","cc":"uniswap"},
 }
-
-FOREX_PAIRS={
-    "EURUSD":{"fred":"DEXUSEU"},
-    "USDJPY":{"fred":"DEXJPUS"},
-    "GBPUSD":{"fred":"DEXUSUK"},
-    "AUDUSD":{"fred":"DEXUSAL"},
-    "USDCAD":{"fred":"DEXCAUS"},
-    "USDCHF":{"fred":"DEXSZUS"},
+FOREX={
+    "EURUSD":{"fred":"DEXUSEU","base":"EUR","target":"USD"},
+    "USDJPY":{"fred":"DEXJPUS","base":"USD","target":"JPY"},
+    "GBPUSD":{"fred":"DEXUSUK","base":"GBP","target":"USD"},
+    "AUDUSD":{"fred":"DEXUSAL","base":"AUD","target":"USD"},
+    "USDCAD":{"fred":"DEXCAUS","base":"USD","target":"CAD"},
+    "USDCHF":{"fred":"DEXSZUS","base":"USD","target":"CHF"},
 }
-
-MACRO_SERIES={
+MACRO={
     "VIX":"VIXCLS","US10Y":"DGS10","US2Y":"DGS2",
     "YieldCurve":"T10Y2Y","FedFunds":"FEDFUNDS",
     "CPI":"CPIAUCSL","Oil_WTI":"DCOILWTICO",
     "M2":"M2SL","HY_Spread":"BAMLH0A0HYM2","Unemployment":"UNRATE"
 }
 
-def live_loop_v13(con, interval_min=60, fetch_every_sec=3600,
-                  window=120, max_cycles=None):
-    all_pairs=list(CRYPTO_PAIRS.keys())+list(FOREX_PAIRS.keys())
-    governors={p:PairGovernor(p,thr=3) for p in all_pairs}
-    cycle=0; macro_cycle=0
-    log("START v13 Railway")
-    tg("DLL v13 pornit pe Railway")
+def live_loop(con,interval_min=60,fetch_every_sec=3600,window=120,max_cycles=None):
+    governors={p:PairGovernor(p) for p in list(CRYPTO)+list(FOREX)}
+    cycle=0; mcycle=0
+    log("START v14"); tg("DLL v14 pornit — 4 surse crypto, 2 surse forex")
     while True:
         cycle+=1
-        if max_cycles and cycle>max_cycles:
-            log("STOP"); tg(f"DLL v13 oprit dupa {cycle-1} cicluri."); break
-        log(f"Ciclu #{cycle}")
-        t0=time.time()
-        macro_cycle+=1
-        if macro_cycle==1 or macro_cycle%24==0:
-            log("Refresh macro...")
-            for name,sid in MACRO_SERIES.items():
-                try:
-                    candles=load_fred(sid)
-                    db_insert(con,name,"fred_macro",candles)
-                    time.sleep(0.4)
-                except Exception as e:
-                    log(f"macro {name}: {e}")
-            for pair,mapping in FOREX_PAIRS.items():
-                try:
-                    candles=load_fred(mapping["fred"])
-                    db_insert(con,pair,"fred",candles)
-                    time.sleep(0.4)
-                except Exception as e:
-                    log(f"forex {pair}: {e}")
-        macro_vals=get_macro_latest(con)
-        macro_regime,macro_score=classify_macro(macro_vals)
-        db_save_macro(con,{**macro_vals,"regime":macro_regime})
-        vix=macro_vals.get("VIX","?")
-        yc=macro_vals.get("YieldCurve","?")
-        log(f"MACRO: {macro_regime}(score={macro_score}) VIX={vix} YC={yc}")
-        try:
-            fg_val,fg_label=load_fg()
-            log(f"F&G: {fg_val} {fg_label}")
-        except:
-            fg_val=50; fg_label="Unknown"
-        nat=[]; orc=[]; unc=[]; blk=[]; alerts=[]
-        for pair,mapping in CRYPTO_PAIRS.items():
+        if max_cycles and cycle>max_cycles: log("STOP"); break
+        log(f"Ciclu #{cycle}"); t0=time.time(); mcycle+=1
+        if mcycle==1 or mcycle%24==0:
+            for n,s in MACRO.items():
+                try: db_insert(con,n,"fred_macro",load_fred(s)); time.sleep(0.4)
+                except Exception as e: log(f"macro {n}:{e}")
+            for p,m in FOREX.items():
+                try: db_insert(con,p,"fred",load_fred(m["fred"])); time.sleep(0.4)
+                except Exception as e: log(f"forex {p}:{e}")
+        mv=get_macro_latest(con); mr,ms=classify_macro(mv)
+        log(f"MACRO:{mr}(s={ms}) VIX={mv.get('VIX','?')} YC={mv.get('YieldCurve','?')}")
+        try: fg,fgl=load_fg()
+        except: fg=50; fgl="Unknown"
+        nat=[]; orc=[]; unc=[]; blk=[]
+        for pair,m in CRYPTO.items():
             gov=governors[pair]; prices={}
             try:
-                candles=load_kraken(mapping["kraken"],interval_min,window+30)
-                new_k=db_insert(con,pair,"kraken",candles)
-                if candles: prices["kraken"]=candles[-1]["v"]
-                time.sleep(0.3)
+                c=load_kraken(m["kraken"],interval_min,window+30)
+                db_insert(con,pair,"kraken",c)
+                if c: prices["kraken"]=c[-1]["v"]
+                time.sleep(0.2)
                 try:
-                    cg_p=load_cg(mapping["cg"])
-                    if cg_p: prices["coingecko"]=cg_p
+                    p=load_cg(m["cg"])
+                    if p: prices["coingecko"]=p
+                    time.sleep(1.0)
                 except: pass
-                time.sleep(1.0)
-                tri_fail=False
-                if len(prices)==2:
-                    vals=list(prices.values())
-                    mean_p=sum(vals)/len(vals)
-                    max_div=max(abs(p-mean_p)/mean_p*100 for p in vals)
-                    tri_fail=max_div>0.5
-                series=db_load(con,pair,"kraken",limit=window)
-                if len(series)<window:
-                    log(f"{pair}: insuficient"); continue
-                snap=dll_v13(series,macro_regime)
-                if tri_fail:
+                try:
+                    p=load_bybit(m["bybit"])
+                    if p: prices["bybit"]=p
+                    time.sleep(0.2)
+                except: pass
+                try:
+                    p=load_coincap(m["cc"])
+                    if p: prices["coincap"]=p
+                    time.sleep(0.2)
+                except: pass
+                ts,divs,conflicts,tf=triangulate_all(prices,0.5)
+                md=max(divs.values()) if divs else 0
+                db_save_tri(con,pair,list(prices.keys()),
+                            {s:round(p,4) for s,p in prices.items()},md,ts)
+                series=db_load(con,pair,"kraken",window)
+                if len(series)<window: continue
+                snap=dll_v14(series,mr)
+                if tf:
                     snap["integrity_flag"]=False
-                    snap["market_flags"].append(f"TRI_FAIL:{round(max_div,4)}%")
+                    snap["market_flags"].append(f"TRI_FAIL:{md:.3f}%")
                     snap["regime"]="ORCHESTRATED"
                 dec=gov.evaluate(snap)
-                cost=0.0028*100
-                exp_move=_estimate_move(series)
-                edge=round(exp_move-cost,4)
+                em=_est_move(series); edge=round(em-0.28,4)
                 if dec["regime"]=="ORCHESTRATED" and edge>0 and not gov.blocked:
                     if not gov.open_trade_id:
-                        tid=db_open_trade(con,pair,"SHORT",
-                                          prices.get("kraken",0),
-                                          dec["regime"],macro_regime)
+                        tid=db_open_trade(con,pair,"SHORT",prices.get("kraken",0),dec["regime"],mr)
                         gov.open_trade_id=tid
-                        log(f"SHORT {pair} @ {prices.get("kraken",0)} edge={edge}%")
+                        log(f"SHORT {pair} @ {prices.get('kraken',0):.2f} edge={edge}%")
                 elif dec["regime"]=="NATURAL" and gov.open_trade_id:
                     e=db_close_trade(con,gov.open_trade_id,prices.get("kraken",0))
-                    result="WIN" if e and e>0 else "LOSS"
-                    log(f"CLOSE {pair} edge={e}% {result}")
-                    tg(f"{result} Paper Trade\n{pair}\nEdge:{e}%\nMacro:{macro_regime}")
+                    r="WIN" if e and e>0 else "LOSS"
+                    log(f"CLOSE {pair} edge={e}% {r}")
+                    tg(f"{r} {pair} Edge:{e}% Macro:{mr}")
                     gov.open_trade_id=None
                 if dec["regime"]=="ORCHESTRATED":
-                    alerts.append(pair)
-                    tg(f"ORCHESTRATED {pair}\nScore:{snap["market_score"]}\nPE={snap["pe"]}\nMacro:{macro_regime}\nF&G:{fg_val}")
-                _log_pair(pair,dec,snap,macro_regime,edge,new_k)
-                _categorize(dec["regime"],gov.blocked,pair,nat,orc,unc,blk)
+                    tg(f"ORC {pair} score={snap["market_score"]} PE={snap["pe"]} src={len(prices)} div={md:.3f}% Macro:{mr} F&G:{fg}")
+                icon="X" if dec["blocked"] else ("R" if dec["regime"]=="ORCHESTRATED" else ("G" if dec["regime"]=="NATURAL" else "Y"))
+                log(f"[{icon}] {pair} {dec["regime"]} mkt={snap["market_score"]} pe={snap["pe"]} H={snap["hurst"]} src={len(prices)} div={md:.3f}%")
+                _cat(dec["regime"],gov.blocked,pair,nat,orc,unc,blk)
             except Exception as e:
-                log(f"ERR {pair}: {e}"); time.sleep(2)
-        for pair in FOREX_PAIRS:
-            gov=governors[pair]
+                log(f"ERR {pair}:{e}"); time.sleep(2)
+        for pair,m in FOREX.items():
+            gov=governors[pair]; prices={}
             try:
-                series=db_load(con,pair,"fred",limit=window)
+                series=db_load(con,pair,"fred",window)
+                try:
+                    p=load_er(m["base"],m["target"])
+                    if p: prices["exchangerate"]=p
+                    if series: prices["fred"]=series[-1]["v"]
+                except: pass
+                ts,divs,conflicts,tf=triangulate_all(prices,0.3)
+                md=max(divs.values()) if divs else 0
+                if series: db_save_tri(con,pair,list(prices.keys()),{s:round(p,6) for s,p in prices.items()},md,ts)
                 if len(series)<window: continue
-                snap=dll_v13(series,macro_regime)
-                dec=gov.evaluate(snap)
-                if dec["regime"]=="ORCHESTRATED": alerts.append(pair)
-                _log_pair(pair,dec,snap,macro_regime,0,0)
-                _categorize(dec["regime"],gov.blocked,pair,nat,orc,unc,blk)
+                snap=dll_v14(series,mr); dec=gov.evaluate(snap)
+                if dec["regime"]=="ORCHESTRATED":
+                    tg(f"ORC FOREX {pair} score={snap["market_score"]} div={md:.4f}%")
+                log(f"[{'R' if dec['regime']=='ORCHESTRATED' else 'G' if dec['regime']=='NATURAL' else 'Y'}] {pair} {dec['regime']} mkt={snap['market_score']} div={md:.4f}%")
+                _cat(dec["regime"],gov.blocked,pair,nat,orc,unc,blk)
             except Exception as e:
-                log(f"ERR {pair}: {e}")
+                log(f"ERR {pair}:{e}")
         log(f"SUMMARY NAT={len(nat)} ORC={len(orc)} UNC={len(unc)} BLOC={len(blk)}")
-        tg(f"DLL v13 Ciclu #{cycle}\nMacro:{macro_regime}\nNAT:{",".join(nat) or "-"}\nORC:{(",".join(orc)) or "-"}\nF&G:{fg_val}")
+        tg(f"DLL v14 Ciclu#{cycle}\nMacro:{mr}\nNAT:{','.join(nat) or '-'}\nORC:{','.join(orc) or '-'}\nF&G:{fg}({fgl})")
         sleep_t=max(0,fetch_every_sec-(time.time()-t0))
-        log(f"Next in {sleep_t:.0f}s")
-        time.sleep(sleep_t)
+        log(f"Next {sleep_t:.0f}s"); time.sleep(sleep_t)
 
-os.makedirs("/data", exist_ok=True)
+os.makedirs("/data",exist_ok=True)
 con=db_init(DB_PATH)
-print("DLL v13 Railway Start")
-tg("DLL v13 test OK")
-live_loop_v13(con=con, interval_min=60, fetch_every_sec=3600,
-              window=120, max_cycles=None)
+print("DLL v14 START")
+tg("DLL v14 OK")
+live_loop(con,interval_min=60,fetch_every_sec=3600,window=120,max_cycles=None)
